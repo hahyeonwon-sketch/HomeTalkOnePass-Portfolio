@@ -1,0 +1,194 @@
+package com.hometalk.onepass.parking.service;
+
+import com.hometalk.onepass.auth.entity.Household;
+import com.hometalk.onepass.auth.entity.User;
+import com.hometalk.onepass.auth.repository.HouseholdRepository;
+import com.hometalk.onepass.notification.entity.NotificationTargetRole;
+import com.hometalk.onepass.notification.entity.NotificationType;
+import com.hometalk.onepass.notification.publisher.NotificationPublisher;
+import com.hometalk.onepass.parking.dto.request.EntryRequest;
+import com.hometalk.onepass.parking.dto.request.ManualEntryRequest;
+import com.hometalk.onepass.parking.dto.response.VehicleSearchResult;
+import com.hometalk.onepass.parking.entity.ParkingLog;
+import com.hometalk.onepass.parking.entity.Vehicle;
+import com.hometalk.onepass.parking.entity.VisitReservation;
+import com.hometalk.onepass.parking.exception.ParkingException;
+import com.hometalk.onepass.parking.repository.ParkingLogRepository;
+import com.hometalk.onepass.parking.repository.VehicleRepository;
+import com.hometalk.onepass.parking.repository.VisitReservationRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
+
+@Service
+@RequiredArgsConstructor
+public class StaffEntryService {
+
+    private final VehicleRepository vehicleRepository;
+    private final VisitReservationRepository visitReservationRepository;
+    private final HouseholdRepository householdRepository;
+    private final ParkingLogRepository parkingLogRepository;
+    private final NotificationPublisher notificationPublisher;
+
+    @Transactional(readOnly = true)
+    public List<VehicleSearchResult> search(String keyword) {
+        String last4 = keyword.replace(" ", "");
+        if (last4.length() != 4) return List.of();
+
+        // DB에서 직접 필터링
+        if (parkingLogRepository.existsParkedByLast4(last4)) {
+            throw new ParkingException("이미 입차된 차량입니다.");
+        }
+
+        List<VehicleSearchResult> results = new ArrayList<>();
+        vehicleRepository.findApprovedByLast4(last4)
+                .stream().map(VehicleSearchResult::ofResident).forEach(results::add);
+        visitReservationRepository.findTodayReservedByLast4(last4, LocalDate.now())
+                .stream().map(VehicleSearchResult::ofReservation).forEach(results::add);
+        return results;
+    }
+
+    @Transactional
+    public void processEntry(EntryRequest request) {
+        switch (request.getType()) {
+            case RESERVATION -> {
+                VisitReservation reservation = visitReservationRepository
+                        .findById(request.getId())
+                        .orElseThrow(() -> new ParkingException("예약 정보를 찾을 수 없습니다."));
+
+                if (reservation.getStatus() != VisitReservation.ReservationStatus.RESERVED
+                        && reservation.getStatus() != VisitReservation.ReservationStatus.PENDING_CONFIRM
+                        && reservation.getStatus() != VisitReservation.ReservationStatus.ENTERED) {
+                    throw new ParkingException("입차 처리할 수 없는 예약 상태입니다.");
+                }
+
+
+                LocalDateTime reservedAt = reservation.getReservedAt();
+                LocalDateTime now = LocalDateTime.now();
+                if (now.isBefore(reservedAt.minusMinutes(30)) || now.isAfter(reservedAt.plusMinutes(30))) {
+                    throw new ParkingException("예약 시간 30분 전후에만 입차 가능합니다.");
+                }
+
+                String vehicleNumber = reservation.getVehicleNumber().replace(" ", "");
+                parkingLogRepository
+                        .findByVehicleNumberAndStatus(vehicleNumber, ParkingLog.ParkingStatus.PARKED)
+                        .ifPresent(l -> { throw new ParkingException("이미 입차된 차량입니다."); });
+
+                ParkingLog log = new ParkingLog(null, vehicleNumber,
+                        reservation.getHousehold(), reservation, null,
+                        ParkingLog.EntryType.RESERVATION);
+                parkingLogRepository.save(log);
+
+                if (reservation.getStatus() != VisitReservation.ReservationStatus.ENTERED) {
+                    reservation.enter();
+                }
+
+                // 트랜잭션 안에서 userId 미리 추출
+                List<Long> residentUserIds = reservation.getHousehold().getUsers().stream()
+                        .filter(u -> u.getRole() == User.UserRole.RESIDENT)
+                        .map(User::getId)
+                        .toList();
+                String vehicleNum = reservation.getVehicleNumber();
+                Long reservationId = reservation.getReservationId();
+
+                residentUserIds.forEach(userId -> notificationPublisher.publishAsync(
+                        userId,
+                        NotificationTargetRole.RESIDENT,
+                        NotificationType.VEHICLE_VISITOR_ENTRY,
+                        "방문 차량 입차",
+                        "예약하신 방문 차량(" + vehicleNum + ")이 도착하여 입차했습니다.",
+                        "/parking/vehicle",
+                        reservationId
+                ));
+            }
+
+            case RESIDENT -> {
+                Vehicle vehicle = vehicleRepository
+                        .findById(request.getId())
+                        .orElseThrow(() -> new ParkingException("차량 정보를 찾을 수 없습니다."));
+
+                if (!Vehicle.VehicleStatus.APPROVED.equals(vehicle.getStatus())) {
+                    throw new ParkingException("승인된 차량만 입차 처리할 수 있습니다.");
+                }
+
+                String vehicleNumber = vehicle.getVehicleNumber().replace(" ", "");
+                parkingLogRepository
+                        .findByVehicleNumberAndStatus(vehicleNumber, ParkingLog.ParkingStatus.PARKED)
+                        .ifPresent(l -> { throw new ParkingException("이미 입차된 차량입니다."); });
+
+                ParkingLog log = new ParkingLog(vehicle, vehicleNumber,
+                        vehicle.getHousehold(), null, null,
+                        ParkingLog.EntryType.NORMAL);
+                parkingLogRepository.save(log);
+
+                // 입주자 본인에게 알림
+                Long userId = vehicle.getUser().getId();
+                String vehicleNum = vehicle.getVehicleNumber();
+                Long vehicleId = vehicle.getVehicleId();
+
+                notificationPublisher.publishAsync(
+                        userId,
+                        NotificationTargetRole.RESIDENT,
+                        NotificationType.VEHICLE_ENTRY,
+                        "입주자 입차",
+                        "입주자 차량(" + vehicleNum + ")이 입차했습니다.",
+                        "/parking/vehicle",
+                        vehicleId
+                );
+            }
+        }
+    }
+
+    @Transactional
+    public void processManualEntry(ManualEntryRequest request) {
+        Household household = null;
+
+        if (hasText(request.getDong()) && hasText(request.getHo())) {
+            household = householdRepository.findByDongAndHo(
+                            request.getDong() + "동", request.getHo() + "호")
+                    .orElse(null);
+        }
+
+        String vehicleNumber = request.getVehicleNumber().replace(" ", "");
+
+        vehicleRepository.findByVehicleNumber(vehicleNumber)
+                .ifPresent(v -> {
+                    if (!Vehicle.VehicleStatus.APPROVED.equals(v.getStatus())) {
+                        throw new ParkingException("승인되지 않은 등록 차량은 입차할 수 없습니다.");
+                    }
+                });
+
+        parkingLogRepository
+                .findByVehicleNumberAndStatus(vehicleNumber, ParkingLog.ParkingStatus.PARKED)
+                .ifPresent(l -> { throw new ParkingException("이미 입차된 차량입니다."); });
+
+        VisitReservation reservation = VisitReservation.ofManual(
+                household, vehicleNumber, request.getPurposeType());
+        visitReservationRepository.save(reservation);
+
+        parkingLogRepository.save(new ParkingLog(null, vehicleNumber,
+                household, reservation, null, ParkingLog.EntryType.MANUAL));
+    }
+
+    @Transactional(readOnly = true)
+    public List<VisitReservation> getTodayVisitList() {
+        return visitReservationRepository.findTodayReserved(LocalDate.now());
+    }
+
+    // ✅ 수정: 전체 로드 후 메모리 필터링 → DB 쿼리에서 직접 처리
+    // 기존: 전체 APPROVED 차량 + 전체 PARKED 기록 메모리 로드 후 filter → 차량 많을수록 성능 저하
+    // 수정: NOT IN 서브쿼리로 DB에서 직접 주차 중이 아닌 차량만 조회
+    @Transactional(readOnly = true)
+    public List<Vehicle> getResidentVehicleList() {
+        return vehicleRepository.findApprovedNotParked();
+    }
+
+    private boolean hasText(String str) {
+        return str != null && !str.isBlank();
+    }
+}
